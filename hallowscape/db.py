@@ -132,9 +132,48 @@ CREATE TABLE IF NOT EXISTS town_clock (
     nights INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY(session_id, user_id)
 );
+CREATE TABLE IF NOT EXISTS candy_runs (
+    guild_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    night INTEGER NOT NULL DEFAULT 1,
+    slot INTEGER NOT NULL DEFAULT 0,
+    hearts INTEGER NOT NULL DEFAULT 3,
+    reputation INTEGER NOT NULL DEFAULT 100,
+    candy INTEGER NOT NULL DEFAULT 3,
+    phase TEXT NOT NULL DEFAULT 'door',
+    asked TEXT NOT NULL DEFAULT '[]',
+    secret INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'active',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(guild_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS candy_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    night INTEGER NOT NULL,
+    visitor TEXT NOT NULL,
+    action TEXT NOT NULL,
+    truth TEXT NOT NULL,
+    hearts INTEGER NOT NULL,
+    reputation INTEGER NOT NULL,
+    candy INTEGER NOT NULL,
+    at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS candy_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    nights INTEGER NOT NULL,
+    hearts INTEGER NOT NULL,
+    reputation INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    finished_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_world_session ON world_history(session_id, happened_at);
 CREATE INDEX IF NOT EXISTS idx_queued_pending ON queued_events(user_id, session_id, delivered_at, due_at);
 CREATE INDEX IF NOT EXISTS idx_history_user ON history(session_id, user_id, seq);
+CREATE INDEX IF NOT EXISTS idx_candy_log ON candy_log(guild_id, user_id, night, id);
 """
 
 ECHO_KEYS = ("saved_stranger", "sin:left_wren", "sin:left_at_door", "faced_watcher", "hid_from_watcher", "pressed_unknown")
@@ -166,6 +205,10 @@ class NotInStory(Exception):
     pass
 
 
+class CandyStarved(Exception):
+    """The bowl is empty, so this door cannot be answered with candy."""
+
+
 class Store:
     def __init__(self, path: Path | Callable[[], Path]):
         self._path = path
@@ -178,6 +221,7 @@ class Store:
         return self._path() if callable(self._path) else self._path
 
     async def initialize(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = await aiosqlite.connect(self.path)
         self.db.row_factory = aiosqlite.Row
         await self.db.executescript("PRAGMA journal_mode=WAL;PRAGMA foreign_keys=ON;")
@@ -685,6 +729,254 @@ class Store:
             "INSERT INTO world_history(session_id,user_id,kind,detail,happened_at) VALUES(?,?,?,?,?)",
             (sid, user_id, "ending", f"The run ended: {ending}.", stamp),
         )
+
+    # --------------------------------------------------------------- the candy door
+    async def candy_run(self, guild_id: int, user_id: int) -> dict[str, Any] | None:
+        """Where the player stands at the door: night, slot, hearts, candy, phase, questions asked."""
+        row = await (
+            await self.conn.execute("SELECT * FROM candy_runs WHERE guild_id=? AND user_id=?", (guild_id, user_id))
+        ).fetchone()
+        return _candy_row(row) if row else None
+
+    async def candy_start(self, guild_id: int, user_id: int, reset: bool = False) -> dict[str, Any]:
+        """Continue this year's run, or wipe the doorway and begin again."""
+        moment = iso(now())
+        candy = _candy()
+        async with self._lock:
+            current = await self.candy_run(guild_id, user_id)
+            if current is not None and (reset or current["status"] != "active"):
+                if current["status"] == "active" and await self._candy_decided(guild_id, user_id):
+                    await self._candy_record(current, "abandoned", moment)
+                await self.conn.execute(
+                    "DELETE FROM candy_runs WHERE guild_id=? AND user_id=?", (guild_id, user_id)
+                )
+                # last year's doors are already summed in candy_history; keeping their rows
+                # would let an old night leak into this year's summary.
+                await self.conn.execute("DELETE FROM candy_log WHERE guild_id=? AND user_id=?", (guild_id, user_id))
+                current = None
+            if current is None:
+                await self.conn.execute(
+                    "INSERT INTO candy_runs(guild_id,user_id,night,slot,hearts,reputation,candy,phase,asked,secret,status,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        guild_id, user_id, 1, 0, candy.START_HEARTS, candy.START_REPUTATION, candy.START_CANDY,
+                        "door", "[]", 0, "active", moment,
+                    ),
+                )
+            else:
+                await self.conn.execute(
+                    "UPDATE candy_runs SET updated_at=? WHERE guild_id=? AND user_id=?",
+                    (moment, guild_id, user_id),
+                )
+            await self.conn.commit()
+            run = await self.candy_run(guild_id, user_id)
+            assert run is not None
+            return run
+
+    async def candy_ask(self, guild_id: int, user_id: int, qid: str) -> dict[str, Any] | None:
+        """Record a question this visitor can answer. None means there was nothing new to ask."""
+        moment = iso(now())
+        async with self._lock:
+            run = await self._candy_active(guild_id, user_id)
+            if run["phase"] != "door" or qid in run["asked"]:
+                return None
+            answers = _candy().visitor(run["night"], run["slot"])["answers"]
+            if qid not in answers:
+                return None
+            await self.conn.execute(
+                "UPDATE candy_runs SET asked=?,updated_at=? WHERE guild_id=? AND user_id=?",
+                (json.dumps(run["asked"] + [qid]), moment, guild_id, user_id),
+            )
+            await self.conn.commit()
+            return await self.candy_run(guild_id, user_id)
+
+    async def candy_decide(self, guild_id: int, user_id: int, give: bool) -> dict[str, Any]:
+        """Hand over candy or shut the door. One write, so a double-click cannot spend twice."""
+        moment = iso(now())
+        candy = _candy()
+        async with self._lock:
+            run = await self._candy_active(guild_id, user_id)
+            if run["phase"] != "door":
+                raise StaleChoice("That door is already closed.")
+            if give and run["candy"] <= 0:
+                raise CandyStarved("The bowl is empty.")
+            visitor = candy.visitor(run["night"], run["slot"])
+            outcome = candy.resolve(visitor, give)
+            hearts = run["hearts"] + outcome["hearts"]
+            reputation = max(0, min(candy.REPUTATION_CAP, run["reputation"] + outcome["reputation"]))
+            await self.conn.execute(
+                "UPDATE candy_runs SET hearts=?,reputation=?,candy=?,secret=?,phase='resolved',asked='[]',updated_at=? "
+                "WHERE guild_id=? AND user_id=?",
+                (
+                    hearts, reputation, run["candy"] + outcome["candy"],
+                    1 if (run["secret"] or outcome["secret"]) else 0, moment, guild_id, user_id,
+                ),
+            )
+            await self.conn.execute(
+                "INSERT INTO candy_log(guild_id,user_id,night,visitor,action,truth,hearts,reputation,candy,at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    guild_id, user_id, run["night"], visitor["id"], "give" if give else "deny",
+                    visitor["truth"], hearts, reputation, run["candy"] + outcome["candy"], moment,
+                ),
+            )
+            await self.conn.commit()
+            return {"outcome": outcome, "visitor": visitor, "run": await self.candy_run(guild_id, user_id)}
+
+    async def candy_supply(self, guild_id: int, user_id: int) -> dict[str, Any]:
+        """Leave Marla's step and open the next night's first door."""
+        async with self._lock:
+            run = await self._candy_active(guild_id, user_id)
+            if run["phase"] != "supply":
+                raise StaleChoice("There is no box on the step.")
+            return await self._candy_open_door(guild_id, user_id)
+
+    async def _candy_open_door(self, guild_id: int, user_id: int) -> dict[str, Any]:
+        """Caller holds the lock: the next door is standing open and nothing has been asked yet."""
+        await self.conn.execute(
+            "UPDATE candy_runs SET phase='door',asked='[]',updated_at=? WHERE guild_id=? AND user_id=?",
+            (iso(now()), guild_id, user_id),
+        )
+        await self.conn.commit()
+        return {"kind": "door", "run": await self.candy_run(guild_id, user_id)}
+
+    async def candy_decision(self, guild_id: int, user_id: int) -> dict[str, Any] | None:
+        """The last door this player answered, with its reaction line.
+
+        The bot can restart between the decision and the next knock; the written line
+        is recomputed from the log instead of being kept in memory.
+        """
+        row = await (
+            await self.conn.execute(
+                "SELECT visitor,action,truth,hearts,reputation,candy FROM candy_log "
+                "WHERE guild_id=? AND user_id=? ORDER BY id DESC LIMIT 1",
+                (guild_id, user_id),
+            )
+        ).fetchone()
+        if not row:
+            return None
+        candy = _candy()
+        visitor = candy.VISITORS.get(row["visitor"])
+        if visitor is None:
+            return None
+        give = row["action"] == "give"
+        return {**dict(row), "give": give, "name": visitor["name"], "text": candy.resolve(visitor, give)["text"]}
+
+    async def candy_advance(self, guild_id: int, user_id: int) -> dict[str, Any]:
+        """One step of the door clock: next child, the night summary and a refill, or an ending."""
+        moment = iso(now())
+        candy = _candy()
+        async with self._lock:
+            run = await self._candy_active(guild_id, user_id)
+            if run["phase"] == "supply":
+                return await self._candy_open_door(guild_id, user_id)
+            if run["phase"] != "resolved":
+                raise StaleChoice("Answer this door first.")
+            if run["hearts"] <= 0:
+                return await self._candy_end(run, "bad", moment)
+            plan = candy.NIGHTS[run["night"] - 1]
+            if run["slot"] + 1 < len(plan["visitors"]):
+                await self.conn.execute(
+                    "UPDATE candy_runs SET slot=?,phase='door',asked='[]',updated_at=? WHERE guild_id=? AND user_id=?",
+                    (run["slot"] + 1, moment, guild_id, user_id),
+                )
+                await self.conn.commit()
+                return {"kind": "door", "run": await self.candy_run(guild_id, user_id)}
+            if run["night"] >= candy.NIGHTS_TOTAL:
+                return await self._candy_end(run, "secret" if run["secret"] else "happy", moment)
+            summary = await self.candy_log_rows(guild_id, user_id, run["night"])
+            await self.conn.execute(
+                "UPDATE candy_runs SET night=?,slot=0,candy=?,phase='supply',asked='[]',updated_at=? "
+                "WHERE guild_id=? AND user_id=?",
+                (run["night"] + 1, run["candy"] + candy.SUPPLY_PER_NIGHT, moment, guild_id, user_id),
+            )
+            await self.conn.commit()
+            return {
+                "kind": "supply",
+                "night_done": run["night"],
+                "summary": summary,
+                "run": await self.candy_run(guild_id, user_id),
+            }
+
+    async def _candy_end(self, run: dict[str, Any], status: str, moment: str) -> dict[str, Any]:
+        candy = _candy()
+        entry = candy.ENDINGS[status]
+        text = entry.get("text") or candy.happy_text(run["reputation"])
+        summary = await self.candy_log_rows(run["guild_id"], run["user_id"], run["night"])
+        await self.conn.execute(
+            "UPDATE candy_runs SET status=?,phase='ended',asked='[]',updated_at=? WHERE guild_id=? AND user_id=?",
+            (status, moment, run["guild_id"], run["user_id"]),
+        )
+        await self._candy_record({**run, "status": status}, status, moment)
+        await self.conn.commit()
+        return {
+            "kind": "ending",
+            "status": status,
+            "title": entry["title"],
+            "text": text,
+            "summary": summary,
+            "run": await self.candy_run(run["guild_id"], run["user_id"]),
+        }
+
+    async def _candy_record(self, run: dict[str, Any], status: str, moment: str) -> None:
+        await self.conn.execute(
+            "INSERT INTO candy_history(guild_id,user_id,nights,hearts,reputation,status,finished_at) VALUES(?,?,?,?,?,?,?)",
+            (
+                run["guild_id"], run["user_id"], run["night"],
+                run["hearts"], run["reputation"], status, moment,
+            ),
+        )
+
+    async def candy_log_rows(self, guild_id: int, user_id: int, night: int) -> list[dict[str, Any]]:
+        rows = await (
+            await self.conn.execute(
+                "SELECT visitor,action,truth,hearts,reputation,candy FROM candy_log "
+                "WHERE guild_id=? AND user_id=? AND night=? ORDER BY id",
+                (guild_id, user_id, night),
+            )
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    async def _candy_decided(self, guild_id: int, user_id: int) -> bool:
+        row = await (
+            await self.conn.execute(
+                "SELECT COUNT(*) AS n FROM candy_log WHERE guild_id=? AND user_id=?", (guild_id, user_id)
+            )
+        ).fetchone()
+        return bool(row and row["n"])
+
+    async def candy_pasts(self, guild_id: int, user_id: int, limit: int = 5) -> list[dict[str, Any]]:
+        """Years this player has stood at this gate before."""
+        rows = await (
+            await self.conn.execute(
+                "SELECT nights,hearts,reputation,status,finished_at FROM candy_history "
+                "WHERE guild_id=? AND user_id=? ORDER BY id DESC LIMIT ?",
+                (guild_id, user_id, limit),
+            )
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    async def _candy_active(self, guild_id: int, user_id: int) -> dict[str, Any]:
+        run = await self.candy_run(guild_id, user_id)
+        if run is None:
+            raise NotInStory("No run at this door.")
+        if run["status"] != "active":
+            raise StaleChoice("This night is already over.")
+        return run
+
+
+def _candy() -> Any:
+    from . import candy
+
+    return candy
+
+
+def _candy_row(row: Any) -> dict[str, Any]:
+    """One door state, with the question list back where it belongs: in front of the code."""
+    data = dict(row)
+    data["asked"] = json.loads(data["asked"] or "[]")
+    data["secret"] = bool(data["secret"])
+    return data
 
 
 def _nodes() -> dict[str, Any]:

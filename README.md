@@ -1,12 +1,14 @@
 # HALLOWSCAPE Discord Bot
 
-A button-based horror story bot built with Python, discord.py, and SQLite. Five chapters and six endings, per-player persistent progress, a town that remembers what you did and keeps moving while you are offline, party play with a shared world log, and `/start` plus `/help`.
+A button-based horror story bot built with Python, discord.py, and SQLite. Five chapters and six endings, per-player persistent progress, a town that remembers what you did and keeps moving while you are offline, party play with a shared world log, a five-night anomaly mini-game at `/start-minigame`, and `/start` plus `/help`.
 
 ## Layout
 
 | Path | Owns |
 | --- | --- |
 | [main.py](main.py) | entry point only |
+| [hallowscape/__main__.py](hallowscape/__main__.py) | the `check` and `guilds` command-line helpers |
+| [hallowscape/config.py](hallowscape/config.py) | `.env` reads, where a blank value means "use the default" |
 | [hallowscape/story.py](hallowscape/story.py) | all prose, items, locations, payoff rules, town events, and the graph validator |
 | [hallowscape/rules.py](hallowscape/rules.py) | predicates, consequence resolution, node rendering (no Discord, no SQL) |
 | [hallowscape/db.py](hallowscape/db.py) | SQLite schema, atomic choice application, memory tables, travel |
@@ -14,14 +16,16 @@ A button-based horror story bot built with Python, discord.py, and SQLite. Five 
 | [hallowscape/engine.py](hallowscape/engine.py) | builds a scene: state + payoffs + offline events + party rumor, and hot-reload |
 | [hallowscape/timer.py](hallowscape/timer.py) | the town clock — what happens to players who are not here |
 | [hallowscape/media.py](hallowscape/media.py) | fetches GIFs and screens them for flashing frames |
+| [hallowscape/candy.py](hallowscape/candy.py) | The Candy Door: rules, questions, eighteen visitors, five nights, endings, and its validator |
+| [hallowscape/candy_ui.py](hallowscape/candy_ui.py) | the door's screens: embeds, the question select menu, give/deny/next views |
 | [hallowscape/ui.py](hallowscape/ui.py) | embeds, views, buttons |
 | [hallowscape/bot.py](hallowscape/bot.py) | commands, startup validation, lifecycle |
 
 ## Run locally
 
 1. Install Python 3.10 or newer.
-2. Create a Discord application and bot in the [Discord Developer Portal](https://discord.com/developers/applications). Enable the **applications.commands** and **bot** scopes when generating its invite URL. The bot only needs permission to send messages, embed links, and use application commands.
-3. Copy `.env.example` to `.env` and set `DISCORD_TOKEN`. Optionally set `DISCORD_GUILD_ID` while developing so slash commands appear quickly in one server.
+2. Create a Discord application and bot in the [Discord Developer Portal](https://discord.com/developers/applications). The bot needs no privileged gateway intents — nothing here reads message content, presence or the member list. Build its invite URL from **OAuth2 → URL Generator** with scopes `bot` and `applications.commands`, and permissions *View Channels*, *Send Messages*, *Embed Links* and *Attach Files* (the last one is what jumpscare GIFs are sent as). Open the URL to join the bot to a server; a bot that is in no server cannot register commands, and Discord answers `403 Missing Access`.
+3. Copy `.env.example` to `.env` and set `DISCORD_TOKEN`. Optionally set `DISCORD_GUILD_ID` while developing so slash commands appear quickly in one server — find the right value with `python -m hallowscape guilds`, which logs in and prints the servers the bot is actually in.
 4. Install and start:
 
    ```powershell
@@ -31,13 +35,16 @@ A button-based horror story bot built with Python, discord.py, and SQLite. Five 
    python main.py
    ```
 
-5. Invite the bot to your server and use `/start`.
+5. Invite the bot to your server and use `/start`. If nobody has joined a party yet, `/start-minigame` still works on its own.
 
-Before the bot logs in it validates the story graph and refuses to start on a broken one. Check the graph without a token any time:
+Before the bot logs in it validates the story graph and the candy door, and refuses to start on a broken one. Check both without a token any time, and list the servers the bot is in with its token:
 
 ```powershell
 python -m hallowscape check
+python -m hallowscape guilds
 ```
+
+Every variable in `.env` except `DISCORD_TOKEN` may be left blank — a blank value means "use the default", and a value that cannot be parsed falls back to the default with a warning instead of stopping the bot. If `DISCORD_GUILD_ID` names a server the bot cannot reach, the bot says so and syncs its commands globally rather than exiting.
 
 The `hallowscape.sqlite3` database is created automatically beside `main.py`. An older database written by the single-file version is upgraded in place on first boot — progress, journal, inventory and world log all carry over, and rows pointing at chapters that no longer exist resume at Chapter 1 instead of crashing. Keep `.env` private.
 
@@ -111,6 +118,31 @@ The clock is a task inside the bot process, so the town only moves while the bot
 It substitutes in node descriptions, variants, conditional lines, payoff lines and town events — everywhere prose speaks to a player. Nobody has one until they choose, and the fallback is `stranger`, so *"Somebody said stranger at the church door"* still reads correctly.
 
 Names come from players, so they get scrubbed before they are stored: mentions (`@everyone`, `@here`, `<@123>`) are removed whole, markdown and angle brackets are stripped, and the result is capped at 32 characters. The name is only ever placed inside ephemeral embeds the owner can see, and it cannot start a ping.
+
+## The Candy Door
+
+`/start-minigame` (and **🍬 The Candy Door** in the `/start` menu) opens a second game on the same lane: five Halloween nights spent answering your own front door. It needs no party, no session and no chapter — the doorway is keyed to `(server, player)`, so anybody in the server can stand at it, and a story run in progress is untouched by it.
+
+The play loop is deduction under a budget. Each night prints a **rule card** — real children throw a shadow, a child's grin has gaps, nobody asks to be invited in — and the card grows as the nights do, up to eight rules by night five. Every visitor gets a written description and a short dialogue, and the player picks questions from a select menu (*Ask them to step into the porch light*, *Ask what's in the bag*, *Ask what time it is*). Answers are free and stay on screen, which is where the tells live. Then one of two buttons: **🍬 Give Candy** or **🚪 Send Away**.
+
+| Consequence | Effect |
+| --- | --- |
+| Feed a real child | +5 reputation — the lane talks about you kindly |
+| Refuse a real child | −10 reputation, and they walk away with nothing |
+| Feed something that is not a child | −1 heart, −15 reputation, and a scare |
+| Refuse it | nothing at all, which is the correct answer |
+
+Three hearts, reputation from 100, and candy that runs out: three sweets to start, and Marla from *The Last Customer* leaves a box of two on the step between nights — warmly if the street approves of you, tersely if it doesn't, and with a note in felt pen if you have become the house that refuses. Feeding everyone is not a strategy; the bowl decides that for you.
+
+Five nights end in one of three ways: **bad** (the hearts run out — something you handed sweets to is inside), **happy** (in three bands, written by how the lane remembers your refusals), and **secret**, which only happens if you are kind to the one anomaly that asks for nothing and never comes back for more. Marla's line after that night is different too, and so is the ending.
+
+The fairness of it is a validator, not a vibe. `candy.validate_door()` — run at startup and by `python -m hallowscape check` (it is not part of `/reload`, which only re-reads the chapters, so a new visitor needs a restart) — refuses a night where an anomaly breaks a rule that card never printed, or whose only tell is a question that visitor does not answer, or where a real child appears to break a rule at all. It also checks the arithmetic: the total candy a run can ever hold (11) has to cover the number of real children at the door (10), so no playthrough is lost purely because the bowl was empty.
+
+Everything a player is shown is rebuilt from SQLite, so closing Discord between the knock and the answer loses nothing: `candy_runs` holds where the doorway is (night, door, hearts, reputation, candy, phase, which questions were asked), `candy_log` holds every decision with the truth line it earned — that is what the night summary reads from — and `candy_history` keeps finished and abandoned years, which the ending screen shows back to you under **📜 THE STREET REMEMBERS**. The night runs `door → resolved → supply → door`, and a button from a moment you already left is refused by the store rather than double-spending a sweet.
+
+Anomaly scares reuse the story's GIF pool and its safety screen, and the same **Settings → Jumpscare GIFs** consent switch: the door sends nothing to a player who turned GIFs off, and prose stands in when a file is refused.
+
+The prose is all in [hallowscape/candy.py](hallowscape/candy.py) (`RULES`, `QUESTIONS`, `VISITORS`, `NIGHTS`, `SUPPLY`, `ENDINGS` and the validator); [hallowscape/candy_ui.py](hallowscape/candy_ui.py) owns the screens. Adding a visitor is a dictionary and one night's id in `NIGHTS`; if its tells are unreachable, the check tells you before the bot boots.
 
 ## Publishing chapters without a restart
 

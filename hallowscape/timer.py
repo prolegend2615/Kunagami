@@ -10,28 +10,28 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import random
 from datetime import timedelta
 from typing import Any
 
-from . import story
+from . import config, story
 from .db import Store, iso, now
 from .rules import matches, with_names
 
 log = logging.getLogger("hallowscape.clock")
 
+
 def clock_minutes() -> int:
-    return int(os.getenv("HALLOWSCAPE_CLOCK_MINUTES", "30"))
+    return config.integer("HALLOWSCAPE_CLOCK_MINUTES", 30)
 
 
 def idle_after() -> timedelta:
-    return timedelta(hours=float(os.getenv("HALLOWSCAPE_IDLE_HOURS", "6")))
+    return timedelta(hours=config.number("HALLOWSCAPE_IDLE_HOURS", 6))
 
 
 def event_every() -> timedelta:
     """How often one player may receive a town change, so the clock never nags."""
-    return timedelta(hours=float(os.getenv("HALLOWSCAPE_EVENT_HOURS", "12")))
+    return timedelta(hours=config.number("HALLOWSCAPE_EVENT_HOURS", 12))
 
 
 def eligible(event: dict[str, Any], st: Any) -> bool:

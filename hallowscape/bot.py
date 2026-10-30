@@ -12,7 +12,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from . import engine, media, story, timer
+from . import candy, candy_ui, config, engine, media, story, timer
 from .db import Store
 from .ui import MenuView
 
@@ -22,17 +22,23 @@ log = logging.getLogger("hallowscape")
 
 def db_path() -> Path:
     """Resolved when the store connects, not at import, so .env is honoured."""
-    return Path(os.getenv("HALLOWSCAPE_DB", ROOT / "hallowscape.sqlite3"))
+    return Path(config.text("HALLOWSCAPE_DB", str(ROOT / "hallowscape.sqlite3")))
 
 
 def story_report() -> tuple[list[str], list[str]]:
-    return story.validate()
+    """Every authored screen in the project, checked before the bot is allowed to wake up."""
+    errors, warnings = story.validate()
+    door_errors, door_warnings = candy.validate_door()
+    return errors + door_errors, warnings + door_warnings
 
 
 class HallowScapeBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
-        super().__init__(command_prefix="!", intents=intents, help_command=None)
+        # No prefix commands exist, so the only trigger is a mention. A string
+        # prefix here would make discord.py warn that the message content intent
+        # is missing, which this bot genuinely does not need.
+        super().__init__(command_prefix=commands.when_mentioned, intents=intents, help_command=None)
         self.store = Store(db_path)
         self.clock_stop = asyncio.Event()
         self.clock_task: asyncio.Task | None = None
@@ -42,19 +48,17 @@ class HallowScapeBot(commands.Bot):
         for line in warnings:
             log.warning("story: %s", line)
         if errors:
-            raise RuntimeError("Story graph failed validation:\n" + "\n".join(f"  - {line}" for line in errors))
-        log.info("story graph valid: %d nodes, %d payoffs", len(story.NODES), len(story.PAYOFFS))
+            raise RuntimeError("The authored content failed validation:\n" + "\n".join(f"  - {line}" for line in errors))
+        log.info(
+            "story graph valid: %d nodes, %d payoffs; candy door valid: %d visitors over %d nights",
+            len(story.NODES),
+            len(story.PAYOFFS),
+            len(candy.VISITORS),
+            candy.NIGHTS_TOTAL,
+        )
         await self.store.initialize()
-        guild_id = os.getenv("DISCORD_GUILD_ID", "").strip()
-        if guild_id.isdigit():
-            guild = discord.Object(id=int(guild_id))
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-            log.info("synced commands to development guild %s", guild_id)
-        else:
-            await self.tree.sync()
-            log.info("synced global commands")
-        if os.getenv("HALLOWSCAPE_CLOCK", "1") != "0":
+        await self._sync_commands()
+        if config.text("HALLOWSCAPE_CLOCK", "1") != "0":
             self.clock_task = self.loop.create_task(timer.run(self.store, self.clock_stop))
             log.info(
                 "town clock running: every %s min, for players idle %s h, one event per %s h per player",
@@ -62,6 +66,36 @@ class HallowScapeBot(commands.Bot):
                 timer.idle_after(),
                 timer.event_every(),
             )
+
+    async def _sync_commands(self) -> None:
+        """Register slash commands, without letting a bad guild ID stop the bot.
+
+        A development guild is a convenience, so Discord refusing it is a warning
+        with the reason in it, not a traceback that ends the process before the
+        gateway is even reached.
+        """
+        guild_id = config.text("DISCORD_GUILD_ID", "")
+        if guild_id.isdigit():
+            guild = discord.Object(id=int(guild_id))
+            self.tree.copy_global_to(guild=guild)
+            try:
+                await self.tree.sync(guild=guild)
+                log.info("synced commands to development guild %s", guild_id)
+                return
+            except discord.Forbidden:
+                log.warning(
+                    "DISCORD_GUILD_ID=%s is not a server this bot can use (Discord said Missing Access). "
+                    "Invite the bot to it with the bot and applications.commands scopes, check the ID, "
+                    "or leave the variable blank. Falling back to global sync.",
+                    guild_id,
+                )
+            except discord.HTTPException as exc:
+                log.warning("guild command sync failed (%s); falling back to global sync", exc)
+        try:
+            await self.tree.sync()
+            log.info("synced global commands; they can take up to an hour to appear")
+        except discord.HTTPException as exc:
+            log.error("command sync failed: %s — /start will not appear until the next boot", exc)
 
     async def close(self) -> None:
         self.clock_stop.set()
@@ -94,6 +128,15 @@ async def start(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=embed, view=MenuView(bot), ephemeral=True)
 
 
+@bot.tree.command(
+    name="start-minigame",
+    description="Stand at the door: five Halloween nights of deciding who gets the candy",
+)
+async def start_minigame(interaction: discord.Interaction) -> None:
+    """No party, no chapter, no story session — the lane is open to anyone in the server."""
+    await candy_ui.open_door(interaction)
+
+
 @bot.tree.command(name="help", description="How to play HALLOWSCAPE")
 async def help_command(interaction: discord.Interaction) -> None:
     embed = discord.Embed(
@@ -107,6 +150,13 @@ async def help_command(interaction: discord.Interaction) -> None:
             "the door — comes back later.\n\n"
             "**Explore Town** lets you walk back to places you have already stood in. They will not "
             "be as you left them, and **🕯️ Return to Your Story** brings you back to your chapter.\n\n"
+            "**/start-minigame** is a separate night on the same lane: **The Candy Door**, five "
+            "Halloween nights spent at your own gate. Read the note, look at who is standing there, "
+            "ask through the door with the menu, then give or refuse. Feed a real child and the "
+            "street talks about you kindly; feed a thing that is not a child and you lose a heart. "
+            "Candy is rationed — Marla leaves a box on the step when the street approves of you — so "
+            "the endings you reach depend on who you chose to believe. One of them only happens if "
+            "you are kind to the wrong visitor.\n\n"
             "Party members each live their own story. What the others did returns to you as rumor. "
             "The town also moves on nights you are not here, and tells you about it when you return.\n\n"
             "**Settings** holds your jumpscare toggle and the name the town should call you. Every "

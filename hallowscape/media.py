@@ -8,10 +8,11 @@ how to deliver it.
 from __future__ import annotations
 
 import io
-import os
 import re
 from dataclasses import dataclass
 from typing import Any
+
+from . import config
 
 MAX_BYTES_DEFAULT_KB = 6144
 FLASHING_MS = 100
@@ -22,11 +23,11 @@ HEADER = re.compile(rb"^GIF8[79]a")
 
 def max_bytes() -> int:
     """Read lazily: .env is not loaded until the bot starts."""
-    return int(os.getenv("HALLOWSCAPE_MAX_GIF_KB", str(MAX_BYTES_DEFAULT_KB))) * 1024
+    return config.integer("HALLOWSCAPE_MAX_GIF_KB", MAX_BYTES_DEFAULT_KB) * 1024
 
 
 def allow_flashing() -> bool:
-    return os.getenv("HALLOWSCAPE_ALLOW_FLASHING", "0") == "1"
+    return config.text("HALLOWSCAPE_ALLOW_FLASHING", "0") == "1"
 
 
 @dataclass

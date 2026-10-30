@@ -522,6 +522,14 @@ class MenuView(discord.ui.View):
             return
         await interaction.response.send_message("**Settings**", view=SettingsView(sid), ephemeral=True)
 
+    @discord.ui.button(label="🍬 The Candy Door", style=discord.ButtonStyle.secondary, row=2)
+    async def candy_door(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        # candy_ui borrows the embed helpers in this module, so it is only imported
+        # once a player actually reaches for the door.
+        from .candy_ui import open_door
+
+        await open_door(interaction)
+
 
 async def open_story(interaction: discord.Interaction, sid: int) -> None:
     store: Store = interaction.client.store
