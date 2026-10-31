@@ -68,6 +68,16 @@ def _embeds(title: str | None, blocks: list[str], footer: str, color: discord.Co
     return out
 
 
+def remaining_questions(visitor: dict[str, Any], asked: list[str]) -> list[str]:
+    """Questions this visitor will still answer, in the order the menu shows them.
+
+    Discord rejects a select menu with no options, so the view asks this before it
+    adds one: a player who has tapped every question gets the decision buttons and
+    nothing else.
+    """
+    return [qid for qid in candy.QUESTIONS if qid in visitor["answers"] and qid not in asked]
+
+
 def door_screen(run: dict[str, Any]) -> tuple[list[discord.Embed], discord.ui.View]:
     plan = candy.NIGHTS[run["night"] - 1]
     visitor = candy.visitor(run["night"], run["slot"])
@@ -86,6 +96,8 @@ def door_screen(run: dict[str, Any]) -> tuple[list[discord.Embed], discord.ui.Vi
         blocks.append(f"❔ {label}\n> {answer}")
     if not run["asked"]:
         blocks.append("*Nothing asked through the door yet.*")
+    elif not remaining_questions(visitor, run["asked"]):
+        blocks.append("*That is all of it. They are waiting on the door, and so is the next one.*")
     embeds = _embeds("🍬 THE CANDY DOOR", [b for b in blocks if b], _meter(run), discord.Color.orange())
     return embeds, DoorView(run)
 
@@ -178,8 +190,7 @@ class QuestionSelect(discord.ui.Select):
     def __init__(self, visitor: dict[str, Any], asked: list[str]):
         options = [
             discord.SelectOption(label=candy.QUESTIONS[qid], value=qid)
-            for qid in candy.QUESTIONS
-            if qid in visitor["answers"] and qid not in asked
+            for qid in remaining_questions(visitor, asked)
         ]
         super().__init__(
             placeholder=f"Ask {visitor['name']} through the door…",
@@ -214,7 +225,8 @@ class DoorView(discord.ui.View):
             return
         if run["phase"] == "door":
             visitor = candy.visitor(run["night"], run["slot"])
-            self.add_item(QuestionSelect(visitor, run["asked"]))
+            if remaining_questions(visitor, run["asked"]):
+                self.add_item(QuestionSelect(visitor, run["asked"]))
             give = DoorButton("🍬 Give Candy", discord.ButtonStyle.success, 1, self._give)
             if run["candy"] <= 0:
                 give.disabled = True
